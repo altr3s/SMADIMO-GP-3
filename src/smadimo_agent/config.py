@@ -17,7 +17,7 @@ class AgentConfig:
     temperature: float = 0.1
     max_tokens: int = 4000
     random_state: int = 42
-    output_root: Path = Path("data")
+    output_root: Path = Path("artifacts")
     keep_run_history: bool = True
     base_url: str = "http://127.0.0.1:1234/v1"
     api_key: str = "lm-studio"
@@ -36,7 +36,7 @@ class AgentConfig:
             temperature=temperature
             if temperature is not None
             else float(os.getenv("LM_STUDIO_TEMPERATURE", "0.1")),
-            output_root=Path(output_root or os.getenv("SMADIMO_OUTPUT_ROOT", "data")),
+            output_root=Path(output_root or os.getenv("SMADIMO_OUTPUT_ROOT", "artifacts")),
             base_url=os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
             api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
         )
