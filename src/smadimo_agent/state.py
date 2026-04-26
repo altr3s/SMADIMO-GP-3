@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import Any, Dict, List, Optional, TypedDict
 
 try:
@@ -14,6 +12,7 @@ PHASE_EDA = "eda"
 PHASE_FEATURES = "feature_engineering"
 PHASE_MODEL_SELECTION = "model_selection"
 PHASE_SPLIT = "split"
+PHASE_TUNE_MODELS = "tune_models"
 PHASE_TRAIN_CLASSIFICATION = "train_classification"
 PHASE_TRAIN_REGRESSION = "train_regression"
 PHASE_TRAIN_CLUSTERING = "train_clustering"
@@ -59,17 +58,13 @@ class StageAgentState(AgentState, total=False):
     schema_summary: Optional[str]
 
 
-def append_log(state: WorkflowState, message: str) -> List[str]:
+def append_log(state, message):
     log = list(state.get("execution_log", []))
     log.append(message)
     return log
 
 
-def merge_phase_output(
-    state: WorkflowState,
-    phase: str,
-    summary: str,
-) -> Dict[str, str]:
+def merge_phase_output(state, phase, summary):
     outputs = dict(state.get("phase_outputs", {}))
     outputs[phase] = summary
     return outputs

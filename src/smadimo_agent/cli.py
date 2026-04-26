@@ -1,16 +1,13 @@
-from __future__ import annotations
-
 import argparse
 import json
-from typing import Optional
 
 from dotenv import load_dotenv
 
-from smadimo_agent.config import AgentConfig, ensure_lm_studio_server
+from smadimo_agent.config import AgentConfig, ensure_llm_endpoint
 from smadimo_agent.workflow import run_pipeline
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Autonomous ML agent built on LangChain and LangGraph.",
     )
@@ -20,35 +17,24 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Business task description passed directly into the agent prompt.",
     )
-    parser.add_argument("--model", default=None, help="Primary LLM model name.")
-    parser.add_argument("--review-model", default=None, help="Optional reviewer model name.")
     parser.add_argument(
         "--output-root",
         default=None,
         help="Directory where runs, reports and memory will be stored.",
     )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="LLM temperature for the primary model.",
-    )
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv=None):
     load_dotenv()
 
     parser = build_parser()
     args = parser.parse_args(argv)
 
     config = AgentConfig.from_runtime(
-        model_name=args.model,
-        review_model_name=args.review_model,
         output_root=args.output_root,
-        temperature=args.temperature,
     )
-    ensure_lm_studio_server(config)
+    ensure_llm_endpoint(config)
 
     result = run_pipeline(
         dataset_path=args.dataset,

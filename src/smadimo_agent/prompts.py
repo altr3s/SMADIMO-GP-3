@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-from typing import Dict
-
 from smadimo_agent.state import (
     PHASE_ANALYZE,
     PHASE_EDA,
@@ -11,27 +7,33 @@ from smadimo_agent.state import (
     PHASE_PERSIST,
     PHASE_REPORT,
     PHASE_SPLIT,
+    PHASE_TUNE_MODELS,
     PHASE_TRAIN_CLASSIFICATION,
     PHASE_TRAIN_CLUSTERING,
     PHASE_TRAIN_REGRESSION,
-    WorkflowState,
 )
 
 
-PHASE_INSTRUCTIONS: Dict[str, str] = {
+PHASE_INSTRUCTIONS = {
     PHASE_ANALYZE: """
 Этап 0. Полностью разберись в датасете и бизнес-задаче.
 Обязательно:
 1. Сначала вызови `profile_dataset`.
 2. Затем вызови `get_dataset_schema`.
 3. Затем определи target и тип ML-задачи через `set_modeling_goal`.
-4. После этого вызови `clean_dataset`.
+4. Затем вызови `analyze_distributions`, чтобы увидеть доминирующие и редкие значения в колонках.
+5. После этого вызови `clean_dataset`.
+Перед очисткой реши, что лучше: заполнить пропуски, оставить их, удалить строки или удалить редкие/аномальные значения.
+Если удаляешь строки через `drop_rows`, обязательно укажи причину в `reason` и общее обоснование в `cleaning_reasoning`.
+Для `clean_dataset` передавай простые аргументы, без вложенного `plan`.
+Шаблон: `clean_dataset(drop_columns="[\"id\",\"title\",\"body\"]", drop_rows="[]", numeric_imputation="median", categorical_imputation="mode", text_imputation="empty", outlier_strategy="iqr_clip", cleaning_reasoning="Короткое обоснование очистки.")`
 Не проводи EDA и не выбирай модели на этом шаге.
 """.strip(),
     PHASE_EDA: """
 Этап 1. Проведи EDA.
-Обязательно вызови `run_eda`.
+Обязательно вызови `analyze_distributions`, затем `run_eda`.
 Зафиксируй пропуски, дисбаланс, аномалии, потенциальные утечки и важные ограничения для моделирования.
+Отдельно смотри на случаи, где почти все строки имеют одно значение, а малая доля строк другое значение.
 """.strip(),
     PHASE_FEATURES: """
 Этап 2. Проведи feature engineering.
@@ -51,6 +53,19 @@ PHASE_INSTRUCTIONS: Dict[str, str] = {
 Этап 4. Подготовь train/val/test split.
 Обязательно вызови `prepare_splits`.
 Для классификации используй стратификацию, если она допустима.
+""".strip(),
+    PHASE_TUNE_MODELS: """
+Этап 4.5. Спланируй и запусти подбор гиперпараметров.
+Обязательно вызови `tune_models`.
+LLM здесь является планировщиком: выбери разумное небольшое пространство поиска для уже выбранных моделей, а реальные метрики должен посчитать Python tool.
+Не делай слишком большой перебор: обычно достаточно 3-8 конфигураций на модель.
+Подбирай параметры только для моделей из `model_plan.json`.
+Используй реальные sklearn-параметры без префикса `model__`, например `alpha`, `C`, `n_estimators`, `max_depth`, `min_samples_leaf`, `learning_rate`, `n_neighbors`, `n_clusters`, `eps`, `min_samples`.
+Передавай аргументы напрямую в tool: `n_iter`, `model_spaces`, `reasoning`. Не создавай вложенный аргумент `plan`.
+Важно: `model_spaces` должен быть строкой с JSON. Для пустого значения используй пустую строку. В JSON используй `null`, а не Python `None`.
+Строго используй такой шаблон вызова:
+`tune_models(n_iter=6, model_spaces="{\"ridge_regression\":{\"alpha\":[0.1,1.0,10.0]},\"random_forest_regressor\":{\"n_estimators\":[50,100],\"max_depth\":[3,5,null],\"min_samples_leaf\":[2,4]}}", reasoning="Короткое объяснение выбора пространства поиска.")`
+Не добавляй внутрь `model_spaces` markdown, комментарии, одинарные кавычки или Python `None`.
 """.strip(),
     PHASE_TRAIN_CLASSIFICATION: """
 Этап 5. Обучи выбранные модели для задачи классификации.
@@ -74,7 +89,8 @@ PHASE_INSTRUCTIONS: Dict[str, str] = {
 """.strip(),
     PHASE_PERSIST: """
 Сравни текущий лучший результат с долговременной памятью.
-Сначала вызови `load_long_term_memory`, затем `save_best_model`.
+Сначала вызови `load_long_term_memory`, затем `load_best_model_from_memory`, затем `save_best_model`.
+Если историческая модель совместима с текущей задачей, используй ее метрики как baseline.
 """.strip(),
     PHASE_REPORT: """
 Сформируй итоговый отчет.
@@ -84,7 +100,7 @@ PHASE_INSTRUCTIONS: Dict[str, str] = {
 }
 
 
-def build_system_prompt(state: Dict[str, str]) -> str:
+def build_system_prompt(state):
     phase = state.get("phase", PHASE_ANALYZE)
     business_task = state.get("business_task", "")
     task_type = state.get("task_type") or "не определен"
@@ -124,7 +140,7 @@ def build_system_prompt(state: Dict[str, str]) -> str:
 """.strip()
 
 
-def build_phase_user_message(state: WorkflowState, phase: str) -> str:
+def build_phase_user_message(state, phase):
     artifacts = state.get("artifacts", {})
     phase_outputs = state.get("phase_outputs", {})
     known_target = state.get("target_column") or "не определен"

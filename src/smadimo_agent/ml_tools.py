@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ast
+import json
+import itertools
 import math
+import pickle
+import random
 import shutil
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -40,14 +44,14 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 from sklearn.svm import LinearSVC
 
-from smadimo_agent.io_utils import read_json, read_table, write_json, write_table, write_text
+from smadimo_agent.io_utils import read_json, read_table, write_json, write_table
 
 try:
     from langchain.tools import ToolRuntime, tool
 except ImportError:
     from langchain_core.tools import tool
 
-    ToolRuntime = Any  # type: ignore
+    ToolRuntime = Any
 
 
 TASK_TYPES = {"classification", "regression", "clustering"}
@@ -135,6 +139,8 @@ class CleaningPlan(BaseModel):
     text_imputation: Literal["empty", "constant", "none"] = "empty"
     fill_constant: str = "missing"
     outlier_strategy: Literal["iqr_clip", "none"] = "iqr_clip"
+    drop_rows: List[Dict[str, str]] = Field(default_factory=list)
+    cleaning_reasoning: str = ""
 
 
 class FeatureSpec(BaseModel):
@@ -171,14 +177,17 @@ def build_ml_tools() -> List[Any]:
         profile_dataset,
         get_dataset_schema,
         set_modeling_goal,
+        analyze_distributions,
         clean_dataset,
         run_eda,
         engineer_features,
         select_candidate_models,
         prepare_splits,
+        tune_models,
         train_models,
         evaluate_models,
         load_long_term_memory,
+        load_best_model_from_memory,
         save_best_model,
         write_report,
     ]
@@ -195,6 +204,7 @@ def _workspace_paths(workspace_dir: Path) -> Dict[str, Path]:
         "schema_json": workspace_dir / "analysis" / "schema_snapshot.json",
         "goal_json": workspace_dir / "analysis" / "modeling_goal.json",
         "cleaning_json": workspace_dir / "analysis" / "cleaning_report.json",
+        "distribution_json": workspace_dir / "analysis" / "distribution_report.json",
         "eda_json": workspace_dir / "analysis" / "eda_report.json",
         "eda_md": workspace_dir / "analysis" / "eda_report.md",
         "feature_json": workspace_dir / "analysis" / "feature_report.json",
@@ -202,12 +212,14 @@ def _workspace_paths(workspace_dir: Path) -> Dict[str, Path]:
         "split_dir": workspace_dir / "modeling" / "splits",
         "split_manifest": workspace_dir / "modeling" / "splits" / "split_manifest.json",
         "leaderboard_json": workspace_dir / "modeling" / "leaderboard.json",
+        "tuning_json": workspace_dir / "modeling" / "hyperparameter_tuning.json",
         "evaluation_json": workspace_dir / "modeling" / "evaluation.json",
+        "memory_baseline_json": workspace_dir / "modeling" / "memory_baseline.json",
         "models_dir": workspace_dir / "models",
-        "current_best_model": workspace_dir / "models" / "best_current_model.joblib",
+        "current_best_model": workspace_dir / "models" / "best_current_model.pkl",
         "memory_dir": workspace_dir.parent / "memory",
         "history_json": workspace_dir.parent / "memory" / "best_registry.json",
-        "memory_model": workspace_dir.parent / "memory" / "best_model.joblib",
+        "memory_model": workspace_dir.parent / "memory" / "best_model.pkl",
         "memory_meta": workspace_dir.parent / "memory" / "best_model_meta.json",
         "report_md": workspace_dir / "reports" / "run_report.md",
         "report_json": workspace_dir / "reports" / "run_report.json",
@@ -230,9 +242,19 @@ def _get_raw_dataset_path(runtime: ToolRuntime) -> Path:
     return Path(runtime.state["dataset_path"]).resolve()
 
 
+def _save_pickle(payload, path):
+    with path.open("wb") as file:
+        pickle.dump(payload, file)
+
+
+def _load_pickle(path):
+    with path.open("rb") as file:
+        return pickle.load(file)
+
+
 def _get_goal(runtime: ToolRuntime) -> Dict[str, Any]:
     workspace_dir = _get_workspace_dir(runtime)
-    return read_json(_workspace_paths(workspace_dir)["goal_json"])
+    return read_json(_workspace_paths(workspace_dir)["goal_json"], default={})
 
 
 def _get_task_type(runtime: ToolRuntime) -> Optional[str]:
@@ -658,6 +680,9 @@ def _apply_cleaning_plan(
         "numeric_cast_columns": [],
         "parsed_date_columns": [],
         "target_rows_removed": 0,
+        "row_drop_rules": [],
+        "rows_removed_by_rules": 0,
+        "cleaning_reasoning": plan.cleaning_reasoning,
     }
 
     df = df.copy()
@@ -678,6 +703,25 @@ def _apply_cleaning_plan(
         existing = [column for column in plan.drop_columns if column in df.columns]
         df = df.drop(columns=existing)
         report["dropped_columns"] = existing
+
+    for rule in plan.drop_rows:
+        column = rule.get("column")
+        value = rule.get("value")
+        reason = rule.get("reason", "")
+        if column not in df.columns:
+            continue
+        before = len(df)
+        df = df[df[column].astype(str) != str(value)].copy()
+        removed = int(before - len(df))
+        report["rows_removed_by_rules"] += removed
+        report["row_drop_rules"].append(
+            {
+                "column": column,
+                "value": value,
+                "removed_rows": removed,
+                "reason": reason,
+            }
+        )
 
     if plan.auto_cast_numeric:
         df, converted = _auto_cast_numeric(df, plan.numeric_coercion_threshold)
@@ -783,6 +827,38 @@ def _detect_leakage_candidates(df: pd.DataFrame, target_column: Optional[str]) -
     return sorted(set(leakage))
 
 
+def _distribution_report(df):
+    report = {}
+    for column in df.columns:
+        series = df[column]
+        counts = series.value_counts(dropna=False).head(20)
+        total = max(len(series), 1)
+        top_values = []
+        for value, count in counts.items():
+            top_values.append(
+                {
+                    "value": str(value),
+                    "count": int(count),
+                    "share": float(count / total),
+                }
+            )
+        rare_values = [
+            item
+            for item in top_values
+            if item["share"] <= 0.01 and item["count"] > 0
+        ]
+        dominant_value = top_values[0] if top_values else None
+        report[column] = {
+            "dtype": str(series.dtype),
+            "missing_count": int(series.isna().sum()),
+            "unique_values": int(series.nunique(dropna=True)),
+            "top_values": top_values,
+            "dominant_value": dominant_value,
+            "rare_values_in_top_20": rare_values,
+        }
+    return report
+
+
 def _validate_target_and_task(df: pd.DataFrame, target_column: Optional[str], task_type: str) -> None:
     if task_type not in TASK_TYPES:
         raise ValueError(f"Unsupported task type: {task_type}")
@@ -872,7 +948,7 @@ def _build_supervised_preprocessor(
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
 
-def _build_model(task_type: str, model_name: str) -> Any:
+def _build_model(task_type: str, model_name: str, model_params: Optional[Dict[str, Any]] = None) -> Any:
     if task_type == "classification":
         registry = {
             "logistic_regression": LogisticRegression(max_iter=2000, n_jobs=None),
@@ -906,7 +982,198 @@ def _build_model(task_type: str, model_name: str) -> Any:
         }
     if model_name not in registry:
         raise ValueError(f"Model `{model_name}` is not registered for task `{task_type}`.")
-    return registry[model_name]
+    estimator = registry[model_name]
+    if model_params:
+        valid_params = estimator.get_params()
+        safe_params = {key: value for key, value in model_params.items() if key in valid_params}
+        if safe_params:
+            estimator.set_params(**safe_params)
+    return estimator
+
+
+def _default_hyperparameter_space(task_type: str, model_name: str) -> Dict[str, List[Any]]:
+    spaces = {
+        "classification": {
+            "logistic_regression": {"C": [0.1, 1.0, 3.0]},
+            "random_forest_classifier": {
+                "n_estimators": [100, 200],
+                "max_depth": [None, 10, 20],
+                "min_samples_leaf": [1, 3],
+            },
+            "gradient_boosting_classifier": {
+                "n_estimators": [100, 200],
+                "learning_rate": [0.05, 0.1],
+                "max_depth": [2, 3],
+            },
+            "linear_svc": {"C": [0.1, 1.0, 3.0]},
+            "k_neighbors_classifier": {"n_neighbors": [5, 9, 11, 15]},
+        },
+        "regression": {
+            "ridge_regression": {"alpha": [0.1, 1.0, 10.0, 100.0]},
+            "sgd_regressor": {
+                "alpha": [0.0001, 0.001],
+                "l1_ratio": [0.15, 0.5],
+            },
+            "random_forest_regressor": {
+                "n_estimators": [100, 200],
+                "max_depth": [None, 10, 20],
+                "min_samples_leaf": [1, 3],
+            },
+            "gradient_boosting_regressor": {
+                "n_estimators": [100, 200],
+                "learning_rate": [0.05, 0.1],
+                "max_depth": [2, 3],
+            },
+            "k_neighbors_regressor": {"n_neighbors": [5, 9, 11, 15]},
+        },
+        "clustering": {
+            "kmeans": {"n_clusters": [2, 3, 4, 5]},
+            "agglomerative_clustering": {"n_clusters": [2, 3, 4, 5]},
+            "dbscan": {
+                "eps": [0.5, 0.7, 1.0],
+                "min_samples": [5, 10],
+            },
+        },
+    }
+    return spaces.get(task_type, {}).get(model_name, {})
+
+
+def _normalize_hyperparameter_space(
+    task_type: str,
+    model_name: str,
+    requested_space: Dict[str, List[Any]],
+) -> Dict[str, List[Any]]:
+    estimator = _build_model(task_type, model_name)
+    valid_params = estimator.get_params()
+    normalized = {}
+    for raw_name, values in requested_space.items():
+        param_name = raw_name.replace("model__", "")
+        if param_name not in valid_params or not isinstance(values, list) or not values:
+            continue
+        normalized[param_name] = values
+    return normalized
+
+
+def _parameter_candidates(space: Dict[str, List[Any]], n_iter: int) -> List[Dict[str, Any]]:
+    if not space:
+        return [{}]
+
+    names = sorted(space)
+    combinations = [dict(zip(names, values)) for values in itertools.product(*(space[name] for name in names))]
+    if not combinations:
+        return [{}]
+    if len(combinations) <= n_iter:
+        return combinations
+
+    sampler = random.Random(42)
+    return sampler.sample(combinations, n_iter)
+
+
+def _parse_model_spaces(value: Optional[str]) -> Dict[str, Dict[str, List[Any]]]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return {}
+
+    text = _extract_json_object_text(text)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    result = {}
+    for model_name, space in parsed.items():
+        if not isinstance(model_name, str) or not isinstance(space, dict):
+            continue
+        clean_space = {}
+        for param_name, values in space.items():
+            if isinstance(param_name, str) and isinstance(values, list) and values:
+                clean_space[param_name] = values
+        if clean_space:
+            result[model_name] = clean_space
+    return result
+
+
+def _parse_json_list(value: Optional[str]) -> List[Any]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+
+    text = _extract_json_array_text(str(value).strip())
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            return []
+
+    return parsed if isinstance(parsed, list) else []
+
+
+def _extract_json_array_text(text: str) -> str:
+    first = text.find("[")
+    last = text.rfind("]")
+    if first != -1 and last != -1 and last > first:
+        return text[first : last + 1]
+    return text
+
+
+def _parse_drop_columns(value: Optional[str]) -> List[str]:
+    parsed = _parse_json_list(value)
+    if parsed:
+        return [str(item) for item in parsed if str(item).strip()]
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _parse_drop_rows(value: Optional[str]) -> List[Dict[str, str]]:
+    parsed = _parse_json_list(value)
+    rules = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        column = item.get("column")
+        if not column:
+            continue
+        rules.append(
+            {
+                "column": str(column),
+                "value": str(item.get("value", "")),
+                "reason": str(item.get("reason", "")),
+            }
+        )
+    return rules
+
+
+def _extract_json_object_text(text: str) -> str:
+    if "<parameter=model_spaces>" in text and "</parameter>" in text:
+        start = text.find("<parameter=model_spaces>") + len("<parameter=model_spaces>")
+        end = text.find("</parameter>", start)
+        if end > start:
+            text = text[start:end].strip()
+
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        return text[first : last + 1]
+    return text
 
 
 def _binary_average(y_true: np.ndarray) -> str:
@@ -984,12 +1251,13 @@ def _fit_supervised_model(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     target_column: str,
+    model_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     feature_train, prep_meta = _prepare_feature_table(train_df, target_column=target_column)
     feature_val, _ = _prepare_feature_table(val_df, target_column=target_column)
 
     preprocessor = _build_supervised_preprocessor(feature_train, target_column=target_column)
-    estimator = _build_model(task_type, model_name)
+    estimator = _build_model(task_type, model_name, model_params=model_params)
     pipeline = Pipeline(
         steps=[
             ("preprocess", preprocessor),
@@ -1031,6 +1299,7 @@ def _fit_supervised_model(
 def _fit_clustering_model(
     model_name: str,
     train_df: pd.DataFrame,
+    model_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     feature_train, prep_meta = _prepare_feature_table(train_df)
     preprocessor = _build_supervised_preprocessor(feature_train.assign(_dummy_target=0), "_dummy_target")
@@ -1039,7 +1308,7 @@ def _fit_clustering_model(
     transformed = preprocessor.fit_transform(X_train)
     transformed = np.asarray(transformed)
 
-    estimator = _build_model("clustering", model_name)
+    estimator = _build_model("clustering", model_name, model_params=model_params)
     if hasattr(estimator, "fit_predict"):
         labels = estimator.fit_predict(transformed)
     else:
@@ -1118,11 +1387,47 @@ def set_modeling_goal(
 
 
 @tool
-def clean_dataset(plan: CleaningPlan, runtime: ToolRuntime) -> str:
-    """Clean the raw dataset according to an explicit cleaning plan."""
+def analyze_distributions(runtime: ToolRuntime) -> str:
+    """Analyze value distributions and rare values before deciding how to clean rows."""
+    workspace_dir = _get_workspace_dir(runtime)
+    df = read_table(_active_dataset_path(runtime))
+    payload = {
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "columns": _distribution_report(df),
+        "note": (
+            "Use this report to decide whether rare values are valid data, noise, "
+            "or a separate business case. Do not remove rows without a reason."
+        ),
+    }
+    path = workspace_dir / "analysis" / "distribution_report.json"
+    write_json(path, payload)
+    return f"Distribution report saved to {path}."
+
+
+@tool
+def clean_dataset(
+    drop_columns: str = "",
+    drop_rows: str = "",
+    numeric_imputation: Literal["median", "mean", "none"] = "median",
+    categorical_imputation: Literal["mode", "constant", "none"] = "mode",
+    text_imputation: Literal["empty", "constant", "none"] = "empty",
+    outlier_strategy: Literal["iqr_clip", "none"] = "iqr_clip",
+    cleaning_reasoning: str = "",
+    runtime: ToolRuntime = None,
+) -> str:
+    """Clean the raw dataset. String arguments are parsed inside Python for local LLM compatibility."""
     workspace_dir = _get_workspace_dir(runtime)
     target_column = _get_target_column(runtime)
     df = read_table(_get_raw_dataset_path(runtime))
+    plan = CleaningPlan(
+        drop_columns=_parse_drop_columns(drop_columns),
+        drop_rows=_parse_drop_rows(drop_rows),
+        numeric_imputation=numeric_imputation,
+        categorical_imputation=categorical_imputation,
+        text_imputation=text_imputation,
+        outlier_strategy=outlier_strategy,
+        cleaning_reasoning=cleaning_reasoning,
+    )
     cleaned_df, report = _apply_cleaning_plan(df, plan, target_column)
     paths = _workspace_paths(workspace_dir)
     write_table(cleaned_df, paths["cleaned_dataset"])
@@ -1156,6 +1461,7 @@ def run_eda(runtime: ToolRuntime) -> str:
         "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
         "roles": roles,
         "missing_by_column": df.isna().sum().to_dict(),
+        "distributions": _distribution_report(df),
         "outliers_by_numeric_column": _outlier_counts(df, target_column),
         "target_distribution": class_balance,
         "top_target_correlations": corr_with_target,
@@ -1171,7 +1477,7 @@ def run_eda(runtime: ToolRuntime) -> str:
         f"- leakage_candidates: {', '.join(payload['leakage_candidates']) or 'none'}",
     ]
     write_json(_workspace_paths(workspace_dir)["eda_json"], payload)
-    write_text(_workspace_paths(workspace_dir)["eda_md"], "\n".join(report_lines))
+    _workspace_paths(workspace_dir)["eda_md"].write_text("\n".join(report_lines), encoding="utf-8")
     return f"EDA report saved to {_workspace_paths(workspace_dir)['eda_json']}."
 
 
@@ -1370,8 +1676,13 @@ def prepare_splits(plan: SplitPlan, runtime: ToolRuntime) -> str:
 
 
 @tool
-def train_models(runtime: ToolRuntime) -> str:
-    """Train the shortlisted models and rank them on the validation split."""
+def tune_models(
+    n_iter: int = 8,
+    model_spaces: str = "",
+    reasoning: str = "",
+    runtime: ToolRuntime = None,
+) -> str:
+    """Tune selected models on train/validation using an LLM-planned search space."""
     workspace_dir = _get_workspace_dir(runtime)
     paths = _workspace_paths(workspace_dir)
     task_type = _get_task_type(runtime)
@@ -1384,17 +1695,112 @@ def train_models(runtime: ToolRuntime) -> str:
     split_dir = paths["split_dir"]
     train_df = read_table(split_dir / "train.csv")
     val_df = read_table(split_dir / "val.csv")
+
+    planned_spaces = {}
+    parsed_model_spaces = _parse_model_spaces(model_spaces)
+    for raw_name, raw_space in parsed_model_spaces.items():
+        normalized_names, _, _ = _normalize_model_names(task_type, [raw_name])
+        if normalized_names and isinstance(raw_space, dict):
+            planned_spaces[normalized_names[0]] = raw_space
+
+    n_iter = min(max(int(n_iter), 1), 16)
+    best_params_by_model = {}
+    tuning_leaderboard = []
+
+    for model_name in selected_models:
+        requested_space = planned_spaces.get(model_name)
+        if requested_space:
+            search_space = _normalize_hyperparameter_space(task_type, model_name, requested_space)
+        else:
+            search_space = _default_hyperparameter_space(task_type, model_name)
+
+        candidates = _parameter_candidates(search_space, n_iter)
+        model_results = []
+
+        for params in candidates:
+            try:
+                if task_type == "clustering":
+                    result = _fit_clustering_model(model_name, train_df, model_params=params)
+                else:
+                    result = _fit_supervised_model(
+                        model_name=model_name,
+                        task_type=task_type,
+                        train_df=train_df,
+                        val_df=val_df,
+                        target_column=target_column,
+                        model_params=params,
+                    )
+                model_results.append(
+                    {
+                        "model_name": model_name,
+                        "params": params,
+                        "metrics": result["metrics"],
+                        "selection_score": result["selection_score"],
+                    }
+                )
+            except Exception as error:
+                model_results.append(
+                    {
+                        "model_name": model_name,
+                        "params": params,
+                        "error": f"{type(error).__name__}: {error}",
+                        "selection_score": -math.inf,
+                    }
+                )
+
+        model_results.sort(key=lambda item: item["selection_score"], reverse=True)
+        best_result = model_results[0]
+        if best_result["selection_score"] == -math.inf:
+            best_params_by_model[model_name] = {}
+        else:
+            best_params_by_model[model_name] = best_result.get("params", {})
+        tuning_leaderboard.extend(model_results)
+
+    tuning_leaderboard.sort(key=lambda item: item["selection_score"], reverse=True)
+    payload = {
+        "task_type": task_type,
+        "target_column": target_column,
+        "n_iter_per_model": n_iter,
+        "reasoning": reasoning,
+        "planned_model_spaces_raw": model_spaces,
+        "planned_model_spaces": parsed_model_spaces,
+        "best_params_by_model": best_params_by_model,
+        "leaderboard": tuning_leaderboard,
+    }
+    write_json(paths["tuning_json"], payload)
+    return f"Tuned {len(selected_models)} models. Results saved to {paths['tuning_json']}."
+
+
+@tool
+def train_models(runtime: ToolRuntime) -> str:
+    """Train the shortlisted models and rank them on the validation split."""
+    workspace_dir = _get_workspace_dir(runtime)
+    paths = _workspace_paths(workspace_dir)
+    task_type = _get_task_type(runtime)
+    target_column = _get_target_column(runtime)
+    model_plan = read_json(paths["model_plan_json"])
+    selected_models = model_plan.get("selected_models", [])
+    if not selected_models:
+        raise ValueError("No selected models found. Run select_candidate_models first.")
+    tuning = read_json(paths["tuning_json"], default={})
+    best_params_by_model = tuning.get("best_params_by_model", {})
+
+    split_dir = paths["split_dir"]
+    train_df = read_table(split_dir / "train.csv")
+    val_df = read_table(split_dir / "val.csv")
     models_dir = paths["models_dir"]
     models_dir.mkdir(parents=True, exist_ok=True)
 
     leaderboard: List[Dict[str, Any]] = []
     for model_name in selected_models:
+        model_params = best_params_by_model.get(model_name, {})
         if task_type == "clustering":
-            result = _fit_clustering_model(model_name, train_df)
+            result = _fit_clustering_model(model_name, train_df, model_params=model_params)
             bundle = {
                 "preprocessor": result["preprocessor"],
                 "model": result["model"],
                 "metadata": result["metadata"],
+                "model_params": model_params,
             }
         else:
             result = _fit_supervised_model(
@@ -1403,21 +1809,24 @@ def train_models(runtime: ToolRuntime) -> str:
                 train_df=train_df,
                 val_df=val_df,
                 target_column=target_column,
+                model_params=model_params,
             )
             bundle = {
                 "pipeline": result["pipeline"],
                 "label_encoder": result["label_encoder"],
                 "metadata": result["metadata"],
+                "model_params": model_params,
             }
 
-        model_path = models_dir / f"{model_name}_validation.joblib"
-        joblib.dump(bundle, model_path)
+        model_path = models_dir / f"{model_name}_validation.pkl"
+        _save_pickle(bundle, model_path)
 
         leaderboard.append(
             {
                 "model_name": model_name,
                 "validation_metrics": result["metrics"],
                 "selection_score": result["selection_score"],
+                "best_params": model_params,
                 "model_path": str(model_path),
             }
         )
@@ -1426,6 +1835,7 @@ def train_models(runtime: ToolRuntime) -> str:
     payload = {
         "task_type": task_type,
         "target_column": target_column,
+        "used_hyperparameter_tuning": bool(best_params_by_model),
         "leaderboard": leaderboard,
         "best_model_name": leaderboard[0]["model_name"] if leaderboard else None,
     }
@@ -1447,6 +1857,7 @@ def evaluate_models(runtime: ToolRuntime) -> str:
 
     best_record = leaderboard[0]
     best_model_name = best_record["model_name"]
+    best_params = best_record.get("best_params", {})
     split_dir = paths["split_dir"]
     train_df = read_table(split_dir / "train.csv")
     val_df = read_table(split_dir / "val.csv")
@@ -1454,11 +1865,12 @@ def evaluate_models(runtime: ToolRuntime) -> str:
 
     if task_type == "clustering":
         combined_df = pd.concat([train_df, val_df], ignore_index=True)
-        result = _fit_clustering_model(best_model_name, combined_df)
+        result = _fit_clustering_model(best_model_name, combined_df, model_params=best_params)
         bundle = {
             "preprocessor": result["preprocessor"],
             "model": result["model"],
             "metadata": result["metadata"],
+            "model_params": best_params,
         }
         test_metrics = result["metrics"]
     else:
@@ -1469,19 +1881,22 @@ def evaluate_models(runtime: ToolRuntime) -> str:
             train_df=combined_df,
             val_df=test_df,
             target_column=target_column,
+            model_params=best_params,
         )
         bundle = {
             "pipeline": result["pipeline"],
             "label_encoder": result["label_encoder"],
             "metadata": result["metadata"],
+            "model_params": best_params,
         }
         test_metrics = result["metrics"]
 
-    joblib.dump(bundle, paths["current_best_model"])
+    _save_pickle(bundle, paths["current_best_model"])
     payload = {
         "task_type": task_type,
         "target_column": target_column,
         "best_model_name": best_model_name,
+        "best_params": best_params,
         "validation_metrics": best_record["validation_metrics"],
         "test_metrics": test_metrics,
         "current_best_model_path": str(paths["current_best_model"]),
@@ -1504,6 +1919,54 @@ def load_long_term_memory(runtime: ToolRuntime) -> str:
         "Loaded long-term memory. "
         f"Best historical model: {best_run.get('best_model_name')} with score {best_run.get('selection_score')}."
     )
+
+
+@tool
+def load_best_model_from_memory(runtime: ToolRuntime) -> str:
+    """Load the historical best model file and record whether it is compatible with this run."""
+    workspace_dir = _get_workspace_dir(runtime)
+    paths = _workspace_paths(workspace_dir)
+    history = read_json(paths["history_json"], default={"best_run": None})
+    best_run = history.get("best_run")
+
+    if not best_run:
+        write_json(paths["memory_baseline_json"], {"status": "empty_memory"})
+        return "Historical model baseline skipped: memory is empty."
+
+    if not paths["memory_model"].exists():
+        write_json(
+            paths["memory_baseline_json"],
+            {
+                "status": "missing_model_file",
+                "historical_best": best_run,
+                "expected_model_path": str(paths["memory_model"]),
+            },
+        )
+        return "Historical model baseline skipped: model file is missing."
+
+    task_type = _get_task_type(runtime)
+    target_column = _get_target_column(runtime)
+    compatible = (
+        best_run.get("task_type") == task_type
+        and best_run.get("target_column") == target_column
+    )
+
+    payload = {
+        "status": "loaded" if compatible else "incompatible_task",
+        "compatible": compatible,
+        "historical_best": best_run,
+        "current_task_type": task_type,
+        "current_target_column": target_column,
+        "model_path": str(paths["memory_model"]),
+    }
+
+    if compatible:
+        _load_pickle(paths["memory_model"])
+
+    write_json(paths["memory_baseline_json"], payload)
+    if compatible:
+        return "Historical best model loaded from memory and is compatible with the current run."
+    return "Historical best model exists, but task type or target differs from the current run."
 
 
 @tool
@@ -1550,8 +2013,10 @@ def write_report(runtime: ToolRuntime) -> str:
     goal = read_json(paths["goal_json"])
     cleaning = read_json(paths["cleaning_json"])
     eda = read_json(paths["eda_json"])
+    distribution = read_json(paths["distribution_json"], default={})
     features = read_json(paths["feature_json"])
     model_plan = read_json(paths["model_plan_json"])
+    tuning = read_json(paths["tuning_json"], default={})
     evaluation = read_json(paths["evaluation_json"])
     history = read_json(paths["history_json"], default={"best_run": None})
 
@@ -1562,9 +2027,11 @@ def write_report(runtime: ToolRuntime) -> str:
         "task_type": goal.get("task_type"),
         "dataset_shape": profile.get("shape"),
         "cleaning": cleaning,
+        "distribution_analysis": distribution,
         "eda": eda,
         "features": features,
         "selected_models": model_plan.get("selected_models", []),
+        "hyperparameter_tuning": tuning,
         "evaluation": evaluation,
         "historical_best": history.get("best_run"),
         "prompting_techniques": [
@@ -1587,6 +2054,8 @@ def write_report(runtime: ToolRuntime) -> str:
         f"- Размер: {profile.get('shape', {}).get('rows')} строк, {profile.get('shape', {}).get('columns')} колонок",
         f"- Удалено дублей: {cleaning.get('dropped_duplicates')}",
         f"- Удалено строк без target: {cleaning.get('target_rows_removed')}",
+        f"- Удалено строк по правилам: {cleaning.get('rows_removed_by_rules')}",
+        f"- Обоснование очистки: {cleaning.get('cleaning_reasoning')}",
         "",
         "## EDA",
         f"- Потенциальные утечки: {', '.join(eda.get('leakage_candidates', [])) or 'не обнаружены'}",
@@ -1596,6 +2065,7 @@ def write_report(runtime: ToolRuntime) -> str:
         "",
         "## Модели",
         f"- Выбранные алгоритмы: {', '.join(model_plan.get('selected_models', []))}",
+        f"- Лучшие гиперпараметры: {tuning.get('best_params_by_model', {})}",
         f"- Лучшая модель текущего запуска: {evaluation.get('best_model_name')}",
         f"- Validation metrics: {evaluation.get('validation_metrics')}",
         f"- Test metrics: {evaluation.get('test_metrics')}",
@@ -1611,5 +2081,5 @@ def write_report(runtime: ToolRuntime) -> str:
     ]
 
     write_json(paths["report_json"], report_json)
-    write_text(paths["report_md"], "\n".join(markdown_lines))
+    paths["report_md"].write_text("\n".join(markdown_lines), encoding="utf-8")
     return f"Final report written to {paths['report_md']}."

@@ -9,7 +9,6 @@ description = "LangChain + LangGraph ML agent for autonomous classical ML workfl
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "joblib>=1.4.2",
     "langchain>=1.0.0",
     "langchain-openai>=0.3.0",
     "langgraph>=0.2.0",
