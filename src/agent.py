@@ -1,13 +1,14 @@
 import os
 from datetime import datetime
 from typing import Any
+import dotenv
 
 from langchain.agents import AgentState, create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from typing_extensions import NotRequired, Required
 
-from tools import get_all_tools, read_json
+from tools import get_all_tools, read_json, write_json
 from prompts import PHASE_TOOLS, get_system_prompt, get_phase_message
 from user_feedback import (
     print_json_summary_block,
@@ -17,6 +18,8 @@ from user_feedback import (
     print_run_footer,
     print_run_header,
 )
+
+dotenv.load_dotenv()
 
 
 class MyAgentState(AgentState[Any]):
@@ -54,13 +57,15 @@ PHASES_AFTER_TRAIN = ["evaluate", "persist", "report"]
 
 
 def run_pipeline(dataset_path, business_task, output_root="artifacts"):
+    llm_model = os.getenv("LLM_MODEL")
+    llm_temperature = os.getenv("LLM_TEMPERATURE", "0.1")
 
     llm = ChatOpenAI(
-        model="gpt-oss-20b",
-        api_key="EMPTY",
-        base_url="http://127.0.0.1:1234/v1",
-        temperature=0.1,
-        max_tokens=4000,
+        model=llm_model,
+        api_key=os.getenv("LLM_API_KEY", "EMPTY"),
+        base_url=os.getenv("LLM_BASE_URL"),
+        temperature=llm_temperature,
+        max_tokens=30000
     )
 
     dataset = os.path.abspath(os.path.expanduser(str(dataset_path)))
@@ -74,6 +79,15 @@ def run_pipeline(dataset_path, business_task, output_root="artifacts"):
     for folder in WORKSPACE_FOLDERS:
         os.makedirs(os.path.join(workspace, folder), exist_ok=True)
     os.makedirs(os.path.join(root, "runs", "memory"), exist_ok=True)
+    write_json(
+        os.path.join(workspace, "analysis", "llm_run_config.json"),
+        {
+            "model": llm_model,
+            "temperature": llm_temperature,
+            "base_url": os.getenv("LLM_BASE_URL"),
+            "saved_at": datetime.now().isoformat(),
+        },
+    )
 
     total_phases = len(PHASES_BEFORE_TRAIN) + 1 + len(PHASES_AFTER_TRAIN)
     print_run_header(run_id, dataset, workspace, business_task)
@@ -89,6 +103,8 @@ def run_pipeline(dataset_path, business_task, output_root="artifacts"):
         "selected_models": [],
         "best_model_name": None,
         "phase_outputs": {},
+        "llm_model": llm_model,
+        "llm_temperature": llm_temperature,
     }
 
     all_tools = get_all_tools()
@@ -124,6 +140,8 @@ def run_pipeline(dataset_path, business_task, output_root="artifacts"):
         "task_type": state.get("task_type"),
         "target_column": state.get("target_column"),
         "best_model": state.get("best_model_name"),
+        "llm_model": state.get("llm_model"),
+        "llm_temperature": state.get("llm_temperature"),
         "report": state.get("report_path"),
         "business_interpretation": state.get("business_report_path"),
         "workspace_dir": state.get("workspace_dir"),

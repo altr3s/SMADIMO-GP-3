@@ -1111,6 +1111,7 @@ def write_report(runtime: ToolRuntime) -> str:
     """Write a final markdown report for the current run."""
     ws = runtime.state["workspace_dir"]
 
+    llm_run_config = read_json(os.path.join(ws, "analysis", "llm_run_config.json"), default={})
     goal = read_json(os.path.join(ws, "analysis", "modeling_goal.json"), default={})
     profile = read_json(os.path.join(ws, "analysis", "dataset_profile.json"), default={})
     cleaning = read_json(os.path.join(ws, "analysis", "cleaning_report.json"), default={})
@@ -1127,6 +1128,10 @@ def write_report(runtime: ToolRuntime) -> str:
         f"**Датасет:** {runtime.state['dataset_path']}",
         f"**Тип задачи:** {goal.get('task_type')}",
         f"**Целевая переменная:** {goal.get('target_column')}",
+        "",
+        "## Конфигурация LLM запуска",
+        f"- Модель: {llm_run_config.get('model')}",
+        f"- Temperature: {llm_run_config.get('temperature')}",
         "",
         "## Анализ датасета",
         f"- Размер: {profile.get('shape', {}).get('rows')} строк, {profile.get('shape', {}).get('columns')} колонок",
@@ -1154,6 +1159,7 @@ def write_report(runtime: ToolRuntime) -> str:
         _rf.write(report)
     write_json(os.path.join(ws, "reports", "run_report.json"), {
         "business_task": runtime.state["business_task"],
+        "llm_run_config": llm_run_config,
         "goal": goal, "evaluation": evaluation,
     })
     return f"Report saved to {report_path}."
