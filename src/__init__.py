@@ -1,4 +1,4 @@
-"""SMADIMO agent package."""
+"""Autonomous ML agent package."""
 
 __all__ = ["__version__"]
 
