@@ -2,7 +2,6 @@ import os
 from datetime import datetime
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain.agents import AgentState, create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -51,17 +50,16 @@ PHASES_BEFORE_TRAIN = [
     "model_selection", "split", "tune_models",
 ]
 
-PHASES_AFTER_TRAIN = ["evaluate", "persist", "report", "business_interpretation"]
+PHASES_AFTER_TRAIN = ["evaluate", "persist", "report"]
 
 
 def run_pipeline(dataset_path, business_task, output_root="artifacts"):
-    load_dotenv()
 
     llm = ChatOpenAI(
-        model=os.environ["LLM_MODEL"],
-        api_key=os.environ["LLM_API_KEY"],
-        base_url=os.environ["LLM_BASE_URL"],
-        temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+        model="gpt-oss-20b",
+        api_key="EMPTY",
+        base_url="http://127.0.0.1:1234/v1",
+        temperature=0.1,
         max_tokens=4000,
     )
 

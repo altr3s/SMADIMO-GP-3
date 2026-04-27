@@ -1,3 +1,20 @@
+PROMPT_TASK_CHARS = 3500
+PROMPT_SCHEMA_CHARS = 4500
+PROMPT_PHASE_SUMMARY_CHARS = 900
+PROMPT_PHASE_MEMORY_TOTAL_CHARS = 9500
+
+
+def _clip_prompt_text(text, limit: int) -> str:
+    if text is None:
+        return ""
+    s = str(text).strip()
+    if len(s) <= limit:
+        return s
+    marker = "\n[…фрагмент обрезан…]"
+    keep = max(0, limit - len(marker))
+    return s[:keep] + marker
+
+
 PHASE_TOOLS = {
     "analyze": ["profile_dataset", "get_dataset_schema", "set_modeling_goal", "analyze_distributions", "clean_dataset"],
     "eda": ["profile_dataset", "get_dataset_schema", "analyze_distributions", "run_eda"],
@@ -10,8 +27,7 @@ PHASE_TOOLS = {
     "train_clustering": ["train_models"],
     "evaluate": ["evaluate_models"],
     "persist": ["load_long_term_memory", "load_best_model_from_memory", "save_best_model"],
-    "report": ["write_report"],
-    "business_interpretation": ["collect_pipeline_highlights", "write_business_report"],
+    "report": ["write_report", "collect_pipeline_highlights", "write_business_report"],
 }
 
 PHASE_INSTRUCTIONS = {
@@ -96,18 +112,14 @@ PHASE_INSTRUCTIONS = {
 """.strip(),
 
     "report": """
-Сформируй итоговый отчет.
-Обязательно вызови `write_report`.
-После вызова инструментов дай пользователю итог на русском обычным текстом (абзацы и маркированные списки), без таблиц в markdown.
-""".strip(),
-
-    "business_interpretation": """
-Этап 11. Бизнес-интерпретация (финальный шаг для ЛПР).
-1. Сначала вызови `collect_pipeline_highlights` — получишь сжатые факты из всех ключевых артефактов прогона.
-2. На основе бизнес-задачи, этих фактов и своего понимания пайплайна подготовь отчёт для бизнеса: обычным языком, без жаргона там, где можно; структура с заголовками ## в markdown допустима.
+Этап 10. Итоговый отчёт по запуску и бизнес-документ для ЛПР — всё на этом шаге.
+1. Обязательно вызови `write_report` — сформируется технический `run_report.md`.
+2. Вызови `collect_pipeline_highlights` — сжатые факты из артефактов прогона.
+3. Подготовь отчёт для бизнеса: обычным языком, без жаргона там, где можно; заголовки ## в markdown допустимы.
    Включи: напоминание цели; что сделано с данными (очень кратко); какая модель выбрана и насколько она «хороша» в прикладных терминах; ограничения и риски; 3–7 конкретных рекомендаций для бизнеса.
-3. Вызови `write_business_report(markdown_report="...")` с полным текстом отчёта на русском. Без markdown-таблиц.
-4. Пользователю в конце дай краткую сводку на русском: где лежит файл и в чём суть для бизнеса.
+4. Вызови `write_business_report(markdown_report="...")` с полным текстом на русском. Без markdown-таблиц. Не используй R², R^2 и «коэффициент детерминации».
+5. Пользователю в конце дай краткую сводку на русском: где лежат оба файла отчётов и в чём суть для бизнеса.
+После вызова инструментов сводка для пользователя — обычным текстом (абзацы и списки), без таблиц в markdown.
 """.strip(),
 }
 
@@ -115,14 +127,16 @@ PHASE_INSTRUCTIONS = {
 def get_system_prompt(state, phase):
     task_type = state.get("task_type") or "не определен"
     target = state.get("target_column") or "не определен"
-    schema = state.get("schema_summary") or "Схема датасета пока не зафиксирована."
+    schema_raw = state.get("schema_summary") or "Схема датасета пока не зафиксирована."
+    schema = _clip_prompt_text(schema_raw, PROMPT_SCHEMA_CHARS)
+    business_task = _clip_prompt_text(state.get("business_task", ""), PROMPT_TASK_CHARS)
 
     return f"""
 Ты автономный ML-агент.
 Твоя роль: опытный ML-инженер и аналитик, который принимает решения строго в рамках бизнес-задачи.
 
 Бизнес-задача:
-{state.get("business_task", "")}
+{business_task}
 
 Текущая фаза: {phase}
 Определенный тип задачи: {task_type}
@@ -142,12 +156,13 @@ def get_system_prompt(state, phase):
 
 Язык ответа пользователю (обязательно):
 - Всю сводку, пояснения и выводы для пользователя пиши на русском языке.
-- Допустимы общепринятые обозначения метрик и имён моделей латиницей (RMSE, R², ROC-AUC, random_forest_regressor и т.п.).
+- Допустимы общепринятые обозначения метрик и имён моделей латиницей (RMSE, MAE, ROC-AUC, random_forest_regressor и т.п.).
+- В отчётах и сводках для пользователя не используй R², R^2 и формулировку «коэффициент детерминации»; для регрессии опирайся на RMSE, MAE и прикладную интерпретацию ошибки.
 
 Формат ответа пользователю (обязательно):
 - Пиши связным текстом: короткие абзацы, при необходимости — маркированные или нумерованные списки.
 - Не используй markdown-таблицы (строки с символами `|`, разделители `|---|---|` и т.п.). Не оформляй данные «как таблицу» в чате.
-- Числа, метрики и сравнения встраивай в предложения («RMSE на валидации — …, на тесте — …») или в виде списка «- модель A: …».
+- Числа, метрики и сравнения встраивай в предложения («RMSE на валидации — …, на тесте — …») или в виде списка «- модель A: …». Не упоминай R².
 - Если нужно перечислить много пар «имя — значение», используй тире в строках списка, а не колонки таблицы.
 
 Техники рассуждения (внутренне применяй, пользователю не копируй дословно):
@@ -161,21 +176,32 @@ def get_system_prompt(state, phase):
 
 
 def get_phase_message(state, phase):
+    schema_line = _clip_prompt_text(
+        state.get("schema_summary") or "не зафиксирована",
+        PROMPT_SCHEMA_CHARS,
+    )
     lines = [
         f"Фаза: {phase}",
-        f"Бизнес-задача: {state['business_task']}",
+        f"Бизнес-задача: {_clip_prompt_text(state['business_task'], PROMPT_TASK_CHARS)}",
         f"Исходный датасет: {state['dataset_path']}",
         f"Рабочая директория: {state['workspace_dir']}",
         f"Определенный target: {state.get('target_column') or 'не определен'}",
         f"Определенный тип задачи: {state.get('task_type') or 'не определен'}",
-        f"Актуальная схема: {state.get('schema_summary') or 'не зафиксирована'}",
+        f"Актуальная схема: {schema_line}",
     ]
 
     if state.get("phase_outputs"):
         lines.append("Краткая память по предыдущим этапам:")
+        mem_chunks = []
         for prev_phase, summary in state["phase_outputs"].items():
             if prev_phase != phase:
-                lines.append(f"- {prev_phase}: {summary}")
+                mem_chunks.append(
+                    f"- {prev_phase}: {_clip_prompt_text(summary, PROMPT_PHASE_SUMMARY_CHARS)}",
+                )
+        mem_block = "\n".join(mem_chunks)
+        if len(mem_block) > PROMPT_PHASE_MEMORY_TOTAL_CHARS:
+            mem_block = _clip_prompt_text(mem_block, PROMPT_PHASE_MEMORY_TOTAL_CHARS)
+        lines.append(mem_block)
 
     lines.append(
         "Верни краткую сводку результата после вызова нужных инструментов. "

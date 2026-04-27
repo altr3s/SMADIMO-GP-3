@@ -21,7 +21,7 @@ from sklearn.linear_model import LogisticRegression, Ridge, SGDRegressor
 from sklearn.metrics import (
     accuracy_score, calinski_harabasz_score, davies_bouldin_score,
     f1_score, mean_absolute_error, mean_squared_error,
-    precision_score, r2_score, recall_score, roc_auc_score, silhouette_score,
+    precision_score, recall_score, roc_auc_score, silhouette_score,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
@@ -38,7 +38,7 @@ def write_json(path, data):
             return {str(k): fix(x) for k, x in v.items()}
         if isinstance(v, (list, tuple)):
             return [fix(x) for x in v]
-        if hasattr(v, "__fspath__"):
+        if hasattr(v, "__fspath__"): #
             return str(v)
         if isinstance(v, (np.integer,)):
             return int(v)
@@ -188,7 +188,6 @@ def prepare_df(df, target=None):
 
 
 def _rank_value(row: dict) -> float:
-    """Для сортировки: новое поле rank_score или устаревшее score в старых артефактах."""
     if row.get("rank_score") is not None:
         try:
             return float(row["rank_score"])
@@ -295,9 +294,7 @@ def fit_supervised(
         metrics = {
             "rmse": float(math.sqrt(mse)),
             "mae": float(mean_absolute_error(y_val, preds)),
-            "r2": float(r2_score(y_val, preds)),
         }
-        # rank_score: больше = лучше (для RMSE используем −RMSE только здесь)
         rank_score = -metrics["rmse"]
 
     _ml_log(f"  готово «{model_name}». Метрики на валидации: {json.dumps(metrics, ensure_ascii=False, default=str)}")
@@ -1062,15 +1059,15 @@ def collect_pipeline_highlights(runtime: ToolRuntime) -> str:
         "leaderboard_head": (tuning.get("leaderboard") or [])[:12],
     }
     parts.append("\n=== Подбор гиперпараметров (фрагмент) ===")
-    parts.append(_json_clip(tuning_lite, 4500))
+    parts.append(_json_clip(tuning_lite, 3200))
 
     lb = read_json(os.path.join(ws, "modeling", "leaderboard.json"), default={})
     parts.append("\n=== Лидерборд ===")
-    parts.append(_json_clip(lb, 4500))
+    parts.append(_json_clip(lb, 3200))
 
     ev = read_json(os.path.join(ws, "modeling", "evaluation.json"), default={})
     parts.append("\n=== Оценка на test (best) ===")
-    parts.append(_json_clip(ev, 3500))
+    parts.append(_json_clip(ev, 2800))
 
     split_m = read_json(os.path.join(ws, "modeling", "splits", "split_manifest.json"), default={})
     parts.append("\n=== Сплиты ===")
@@ -1081,7 +1078,7 @@ def collect_pipeline_highlights(runtime: ToolRuntime) -> str:
     parts.append(_json_clip(mem, 1500))
 
     text = "\n".join(parts)
-    max_out = 28000
+    max_out = 10000
     if len(text) > max_out:
         text = text[: max_out - 80] + "\n\n[… вывод обрезан по длине; опирайся на имеющееся …]"
     return text
