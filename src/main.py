@@ -4,8 +4,7 @@ from agent import run_pipeline
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parent.parent
-    dataset = root / "data" / "apartments_for_rent_classified_10K.csv"
+    dataset = "/Users/vavanin/Desktop/Projects/HSE/Смадимо/SMADIMO-GP-3/data/apartments_for_rent_classified_10K.csv"
     run_pipeline(
         dataset_path=str(dataset),
         business_task=(
