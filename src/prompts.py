@@ -62,7 +62,7 @@ PHASE_INSTRUCTIONS = {
     "model_selection": """
 Этап 3. Выбери пул релевантных алгоритмов.
 Обязательно вызови `select_candidate_models`.
-Нужно выбрать минимум 2 модели и обосновать выбор.
+Нужно выбрать 3 модели и обосновать выбор.
 Используй только поддерживаемые имена моделей:
 - classification: logistic_regression, random_forest_classifier, gradient_boosting_classifier, linear_svc, k_neighbors_classifier
 - regression: ridge_regression, sgd_regressor, random_forest_regressor, gradient_boosting_regressor, k_neighbors_regressor
@@ -78,7 +78,7 @@ PHASE_INSTRUCTIONS = {
     "tune_models": """
 Этап 4.5. Спланируй и запусти подбор гиперпараметров.
 Обязательно вызови `tune_models`.
-Выбери разумное небольшое пространство поиска для уже выбранных моделей — обычно достаточно 3-8 конфигураций на модель.
+Выбери разумное небольшое пространство поиска для уже выбранных моделей — обычно достаточно 3 конфигурации на модель.
 Используй реальные sklearn-параметры без префикса `model__`: alpha, C, n_estimators, max_depth, min_samples_leaf, learning_rate, n_neighbors, n_clusters, eps, min_samples.
 Передавай аргументы напрямую: `n_iter`, `model_spaces`, `reasoning`.
 `model_spaces` должен быть строкой с JSON. В JSON используй `null`, а не Python `None`.
